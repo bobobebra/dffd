@@ -1,40 +1,44 @@
 #!/usr/bin/env python3
 """
-win_server.py — Windows remote-control server (run on the Windows host)
+win_server_installer.py
 
-Usage:
-  python win_server.py --setup          # create config in %LOCALAPPDATA%\WinRC\config.json (interactive)
-  python win_server.py --run            # run server (foreground)
-  python win_server.py --kill           # send local shutdown to running server (localhost)
+Portable installer for WinRC server:
+- When run, shows a clear consent GUI describing what will happen.
+- On consent it copies the running exe to %LOCALAPPDATA%\WinRC\win_server.exe
+- Writes config.json (port + shared_secret)
+- Registers a per-user Scheduled Task to run at logon (visible in Task Scheduler)
+- Optionally adds a firewall rule (requires elevation; will try and warn)
+- Leaves logs in %LOCALAPPDATA%\WinRC\
 
-When built to an exe with PyInstaller using --noconsole, it will run silently.
+How to build:
+  pip install pyinstaller
+  pyinstaller --onefile --noconsole win_server_installer.py
+The result (dist\win_server_installer.exe) is what you copy to target PCs.
+
+IMPORTANT: Run this ONLY on machines you own/are authorized to manage. Installer is explicit and visible.
 """
-import os, sys, json, socket, threading, base64, hmac, hashlib, time, argparse, subprocess
+import os, sys, json, time, shutil, subprocess
 from pathlib import Path
-from io import BytesIO
+import tkinter as tk
+from tkinter import messagebox, simpledialog
 
+# ---------- Config ----------
 APP_NAME = "WinRC"
-APP_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")) / APP_NAME
-CONFIG_PATH = APP_DIR / "config.json"
-LOG_PATH = APP_DIR / "server.log"
-KILL_FILE = APP_DIR / "kill.switch"
-STOP_EVENT = threading.Event()
+INSTALL_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")) / APP_NAME
+TARGET_EXE_NAME = "win_server.exe"   # the installed server name
+CONFIG_NAME = "config.json"
+LOG_NAME = "installer.log"
 
-# ----------------- Try imports -----------------
-# PyAutoGUI and Pillow are required. If running as an exe these are bundled.
-try:
-    import pyautogui
-    from PIL import Image
-except Exception as e:
-    # helpful error for dev-time runs
-    print("Missing dependency:", e)
-    raise
+# Minimal server stub: The installer will copy itself (current exe) to target path.
+# The actual server code can be the same file (installer) when called with --run,
+# or you can replace the installed exe later with a different build. For simplicity
+# we'll allow the installed exe to be the same binary and run with --run arg.
 
-# ----------------- helpers -----------------
+# ---------- Utilities ----------
 def log(msg):
     try:
-        APP_DIR.mkdir(parents=True, exist_ok=True)
-        with open(LOG_PATH, "a", encoding="utf-8") as f:
+        INSTALL_DIR.mkdir(parents=True, exist_ok=True)
+        with open(INSTALL_DIR / LOG_NAME, "a", encoding="utf-8") as f:
             f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
     except Exception:
         pass
@@ -43,178 +47,158 @@ def gen_secret():
     import secrets, base64
     return base64.b64encode(secrets.token_bytes(32)).decode()
 
-def sign(secret_bytes: bytes, payload: bytes) -> str:
-    return hmac.new(secret_bytes, payload, hashlib.sha256).hexdigest()
-
-def verify(secret_bytes: bytes, payload: bytes, signature: str) -> bool:
+def run_subprocess(cmd, sudo=False):
+    # helper for running commands; returns (rc, stdout+stderr)
     try:
-        return hmac.compare_digest(sign(secret_bytes, payload), signature)
-    except Exception:
-        return False
-
-def send_json(conn, obj):
-    raw = json.dumps(obj).encode()
-    conn.sendall(len(raw).to_bytes(4, "big") + raw)
-
-def recv_json(conn):
-    hdr = conn.recv(4)
-    if not hdr or len(hdr) < 4:
-        return None
-    length = int.from_bytes(hdr, "big")
-    data = b""
-    while len(data) < length:
-        chunk = conn.recv(length - len(data))
-        if not chunk:
-            break
-        data += chunk
-    if not data:
-        return None
-    return json.loads(data.decode())
-
-# ----------------- config -----------------
-DEFAULT = {
-    "port": 50000,
-    "shared_secret": "",   # filled at setup
-    "allow": {
-        "keys": True,
-        "mouse": True,
-        "screenshot": True,
-        "shutdown": True
-    }
-}
-
-def load_config():
-    if CONFIG_PATH.exists():
-        return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-    return None
-
-def save_config(cfg):
-    APP_DIR.mkdir(parents=True, exist_ok=True)
-    CONFIG_PATH.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
-
-# ----------------- setup -----------------
-def setup_interactive():
-    cfg = DEFAULT.copy()
-    cfg["shared_secret"] = gen_secret()
-    print("=== WinRC setup ===")
-    port = input(f"Port [default {cfg['port']}]: ").strip()
-    if port.isdigit():
-        cfg["port"] = int(port)
-    print("Generated shared secret (copy this for your Linux controller):")
-    print(cfg["shared_secret"])
-    save_config(cfg)
-    print("Config saved to:", CONFIG_PATH)
-
-# ----------------- killfile watcher -----------------
-def killfile_watchdog():
-    while not STOP_EVENT.is_set():
-        if KILL_FILE.exists():
-            log("Kill file detected, stopping.")
-            STOP_EVENT.set()
-            break
-        time.sleep(1.0)
-
-# ----------------- client handler -----------------
-def handle_client(conn, addr, cfg):
-    secret = cfg["shared_secret"].encode()
-    allow = cfg.get("allow", {})
-    try:
-        conn.settimeout(10)
-        hello = recv_json(conn)
-        if not hello or hello.get("type") != "auth":
-            send_json(conn, {"type":"auth_resp","ok":False,"reason":"no auth"}); return
-        payload = (hello.get("payload") or "").encode()
-        if not verify(secret, payload, hello.get("sig","")):
-            send_json(conn, {"type":"auth_resp","ok":False,"reason":"bad signature"}); return
-        send_json(conn, {"type":"auth_resp","ok":True})
-        conn.settimeout(None)
-
-        while not STOP_EVENT.is_set():
-            msg = recv_json(conn)
-            if msg is None:
-                break
-            body = msg.get("body") or {}
-            if not verify(secret, json.dumps(body).encode(), msg.get("sig","")):
-                send_json(conn, {"type":"error","reason":"bad signature"}); continue
-            act = body.get("action")
-            if act == "keypress" and allow.get("keys", True):
-                pyautogui.press(str(body.get("key")))
-                send_json(conn, {"type":"ok"}); continue
-            if act == "hotkey" and allow.get("keys", True):
-                pyautogui.hotkey(*body.get("keys", [])); send_json(conn, {"type":"ok"}); continue
-            if act == "click" and allow.get("mouse", True):
-                pyautogui.click(); send_json(conn, {"type":"ok"}); continue
-            if act == "move" and allow.get("mouse", True):
-                x = int(body.get("x", 0)); y = int(body.get("y", 0))
-                pyautogui.moveTo(x, y); send_json(conn, {"type":"ok"}); continue
-            if act == "screenshot" and allow.get("screenshot", True):
-                img = pyautogui.screenshot()
-                buf = BytesIO(); img.save(buf, format="PNG")
-                send_json(conn, {"type":"screenshot","data":base64.b64encode(buf.getvalue()).decode()}); continue
-            if act == "shutdown" and allow.get("shutdown", True):
-                send_json(conn, {"type":"ok","msg":"stopping"}); STOP_EVENT.set(); break
-            send_json(conn, {"type":"error","reason":"unknown/disabled action"})
+        proc = subprocess.run(cmd, capture_output=True, text=True, shell=False)
+        out = (proc.stdout or "") + (proc.stderr or "")
+        return proc.returncode, out
     except Exception as e:
-        try: send_json(conn, {"type":"error","reason":str(e)})
-        except: pass
-    finally:
-        conn.close()
+        return 1, str(e)
 
-# ----------------- server run -----------------
-def run_server():
-    cfg = load_config()
-    if not cfg or not cfg.get("shared_secret"):
-        print("Config missing: run --setup first"); return
-    port = int(cfg.get("port", 50000))
-    log(f"Starting on 0.0.0.0:{port}")
-    t = threading.Thread(target=killfile_watchdog, daemon=True); t.start()
+# ---------- Installer actions ----------
+def write_config(port, secret):
+    cfg = {"port": int(port), "shared_secret": secret, "allow": {"keys": True, "mouse": True, "screenshot": True, "shutdown": True}}
+    INSTALL_DIR.mkdir(parents=True, exist_ok=True)
+    with open(INSTALL_DIR / CONFIG_NAME, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2)
+    log(f"Written config: port={port}")
 
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.bind(("0.0.0.0", port))
-    s.listen(5)
-    s.settimeout(1.0)
+def copy_self_to_install():
+    """Copy running exe/script to INSTALL_DIR/TARGET_EXE_NAME.
+       If running as a script (not frozen), copy the script and rename to .exe is not meaningful.
+       This installer is intended to be frozen into a single exe with PyInstaller.
+    """
+    src = Path(sys.executable) if getattr(sys, "frozen", False) else Path(__file__).resolve()
+    dest = INSTALL_DIR / TARGET_EXE_NAME
+    INSTALL_DIR.mkdir(parents=True, exist_ok=True)
     try:
-        while not STOP_EVENT.is_set():
-            try:
-                conn, addr = s.accept()
-            except socket.timeout:
-                continue
-            log(f"Client connected: {addr}")
-            threading.Thread(target=handle_client, args=(conn, addr, cfg), daemon=True).start()
-    finally:
-        s.close()
-        log("Server stopped")
-
-# ----------------- local kill -----------------
-def local_kill():
-    cfg = load_config()
-    if not cfg:
-        print("No config"); return
-    port = cfg.get("port", 50000); secret = cfg["shared_secret"].encode()
-    body = {"action":"shutdown"}
-    msg = {"type":"action","body":body,"sig":sign(secret, json.dumps(body).encode())}
-    hello_payload = b"local-kill"
-    hello = {"type":"auth","payload":hello_payload.decode(),"sig":sign(secret, hello_payload)}
-    try:
-        with socket.create_connection(("127.0.0.1", port), timeout=2) as c:
-            send_json(c, hello); _ = recv_json(c); send_json(c, msg)
-        print("Shutdown sent")
+        shutil.copy2(str(src), str(dest))
+        # ensure executable bit (for consistency)
+        os.chmod(dest, 0o755)
+        log(f"Copied {src} -> {dest}")
+        return True, str(dest)
     except Exception as e:
-        print("Send failed:", e)
+        log(f"Copy failed: {e}")
+        return False, str(e)
 
-# ----------------- main -----------------
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--setup", action="store_true")
-    parser.add_argument("--run", action="store_true")
-    parser.add_argument("--kill", action="store_true")
-    args = parser.parse_args()
-    if args.setup:
-        setup_interactive()
-    elif args.run:
-        run_server()
-    elif args.kill:
-        local_kill()
+def create_schtask(exe_path):
+    """Create a per-user scheduled task that runs the exe at logon.
+       Uses schtasks.exe with /SC ONLOGON. This is visible in Task Scheduler.
+    """
+    task_name = f"{APP_NAME}-Server"
+    # wrap in double quotes properly for schtasks
+    cmd = ["schtasks", "/Create", "/SC", "ONLOGON", "/RL", "LIMITED", "/TN", task_name, "/TR", f'"{exe_path}" --run', "/F"]
+    rc, out = run_subprocess(cmd)
+    if rc == 0:
+        log("Scheduled task created.")
+        return True, out
     else:
-        print("Use --setup / --run / --kill")
+        log(f"Schtasks failed: {out}")
+        return False, out
+
+def add_firewall_rule(port):
+    """Try to add a firewall rule for Private profile. This may require elevation.
+       We'll attempt and report result; failure does not abort install.
+    """
+    name = f"{APP_NAME}-{port}"
+    cmd = ["netsh", "advfirewall", "firewall", "add", "rule", f"name={name}", "dir=in", "action=allow", "protocol=TCP", f"localport={port}", "profile=private"]
+    rc, out = run_subprocess(cmd)
+    if rc == 0:
+        log("Firewall rule added.")
+        return True, out
+    else:
+        log(f"Firewall rule failed: {out}")
+        return False, out
+
+# ---------- GUI consent flow ----------
+def run_installer_flow():
+    root = tk.Tk()
+    root.withdraw()
+
+    info = (
+        f"This installer will (with your consent):\n\n"
+        f"• Install the WinRC server into:\n  {INSTALL_DIR}\\\n"
+        f"• Create a visible Scheduled Task named '{APP_NAME}-Server' that runs at logon\n"
+        f"• Write a config file with a generated shared secret (you must copy this to your controller)\n"
+        f"• Optionally add a Windows Firewall rule for the chosen port (may require admin)\n\n"
+        "Only continue if you own or have permission to modify this PC. All files and the task are visible and removable.\n\n"
+        "Continue?"
+    )
+    if not messagebox.askokcancel("WinRC installer — consent", info):
+        messagebox.showinfo("Cancelled", "Installer cancelled by user.")
+        return
+
+    # port prompt
+    port = simpledialog.askstring("Port", "Port to listen on (default 50000):")
+    if not port or not port.strip().isdigit():
+        port = "50000"
+
+    # secret prompt (user may paste one, or press Cancel to generate)
+    secret = simpledialog.askstring("Shared secret", "Paste a shared secret to use (leave empty to auto-generate):")
+    if not secret:
+        secret = gen_secret()
+
+    # copy the running exe into place
+    ok, info_msg = copy_self_to_install()
+    if not ok:
+        messagebox.showerror("Copy failed", f"Failed to copy installer to install folder:\n{info_msg}\n\nInstall aborted.")
+        return
+
+    # write config
+    try:
+        write_config(port, secret)
+    except Exception as e:
+        messagebox.showerror("Config error", f"Failed to write config: {e}")
+        return
+
+    # create scheduled task
+    exe_path = str(INSTALL_DIR / TARGET_EXE_NAME)
+    ok_task, out_task = create_schtask(exe_path)
+    if not ok_task:
+        messagebox.showwarning("Scheduled task", f"Could not create scheduled task automatically.\n\nOutput:\n{out_task}\n\nYou can create a task manually or run the installer as admin.")
+    else:
+        messagebox.showinfo("Scheduled task", f"Scheduled task created (visible in Task Scheduler): {APP_NAME}-Server")
+
+    # firewall
+    if messagebox.askyesno("Firewall", "Attempt to add a Windows Firewall rule for the chosen port? (may require admin)"):
+        ok_fw, out_fw = add_firewall_rule(port)
+        if ok_fw:
+            messagebox.showinfo("Firewall", "Firewall rule added (Private profile).")
+        else:
+            messagebox.showwarning("Firewall", f"Could not add firewall rule automatically.\n\nOutput:\n{out_fw}\n\nYou can add it manually.")
+
+    # final message with secret
+    messagebox.showinfo("Installed",
+                        f"Installation complete.\n\nInstall folder: {INSTALL_DIR}\nConfig: {CONFIG_NAME}\n\nShared secret (copy this to your controller):\n\n{secret}\n\nRemember to keep this secret private.")
+    log("Install complete.")
+    root.destroy()
+
+# ---------- If run as EXE with --run, behave as server launcher ----------
+def run_installed_mode():
+    """If the exe is called with --run, we launch the server logic (the same binary)
+       with argument --run; expected to exist as installed exe. We try to exec it.
+       If you want the installer exe to also contain the full server code, you'd
+       include server behavior here. For safety we attempt to re-exec the installed exe.
+    """
+    installed = INSTALL_DIR / TARGET_EXE_NAME
+    if installed.exists():
+        # run it in background
+        subprocess.Popen([str(installed), "--run"], shell=False)
+        log("Launched installed exe with --run.")
+    else:
+        log("Installed exe not found; cannot run.")
+    # exit installer process (if we were the installer)
+    sys.exit(0)
+
+# ---------- main ----------
+def main():
+    # If called with --run, act as server-runner (to keep behavior consistent when scheduled task runs installed exe)
+    if "--run" in sys.argv:
+        run_installed_mode()
+
+    # normal installer UI
+    run_installer_flow()
+
+if __name__ == "__main__":
+    main()
